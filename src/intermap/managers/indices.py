@@ -204,7 +204,10 @@ def get_uniques_triads(universe, unknown_names):
     for residue in uniq_disconnected:
         mono = universe.residues[uniq_disconnected[residue][0]]
         mda_disconnected[residue] = mono
-        known_atoms = mono.atoms.select_atoms(f"not name {unknowns}")
+        if unknowns:
+            known_atoms = mono.atoms.select_atoms(f"not name {unknowns}")
+        else:
+            known_atoms = mono.atoms
         rdk_disconnected[residue] = ag2rdkit(known_atoms)
 
     rdkit_ = time.time() - stamp
@@ -319,7 +322,10 @@ class IndexManager:
         # Load the trajectory
         stamp0 = time.time()
         trajs = [cmn.check_path(x.strip()) for x in self.traj.split(',')]
-        universe = mda.Universe(*([self.topo] + trajs))
+        topo_kwargs = {}
+        if self.topo.endswith('.top'):
+            topo_kwargs['topology_format'] = 'ITP'
+        universe = mda.Universe(*([self.topo] + trajs), **topo_kwargs)
         masses = [round(x) for x in universe.atoms.masses]
         names = universe.atoms.names
         pt_symbols, pt_masses, real_names = get_periodic_table_info()
@@ -342,10 +348,11 @@ class IndexManager:
             elements.append(element)
         elements = np.asarray(elements)
         radii[''] = 0.0
-
-        logger.warning(f"Unknown elements found in the trajectory: {unknown}. "
-                       f"They will be assigned the symbol 'Z' and a VDW radius of 0. "
-                       f"Please check the topology if this is unexpected.")
+        
+        if unknown:
+            logger.warning(f"Unknown elements found in the trajectory: {unknown}. "
+                           f"They will be assigned the symbol 'Z' and a VDW radius of 0. "
+                           f"Please check the topology if this is unexpected.")
 
         trajs = [x.strip() for x in self.traj.split(',')]
 
