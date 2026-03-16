@@ -22,12 +22,6 @@ from intermap.managers.cutoffs import CutoffsManager
 from intermap.managers.indices import IndexManager
 
 
-# High Priority
-# todo: Reorganize the code
-# todo: start writing tests
-# todo: assert identity against  prolif, again
-# todo: check docstrings
-
 def run(mode='production'):
     """
     Run the InterMap workflow.
@@ -35,11 +29,8 @@ def run(mode='production'):
     Args:
         mode (str): Mode of operation. Can be 'debug' or 'production'.
     """
-    # >>>> Detect args
     config = ConfigManager(mode=mode)
     args = Namespace(**config.config_args)
-
-    # >>>> Run the InterMap workflow
     workflow(args)
 
 
@@ -51,11 +42,8 @@ def execute(cfg_path, mode='production'):
         cfg_path (str): Path to the configuration file containing parameters.
         mode (str): Mode of operation. Can be 'debug' or 'production'.
     """
-    # >>>> Detect args
     config = ConfigManager(mode=mode, cfg_path=cfg_path)
     args = Namespace(**config.config_args)
-
-    # >>>> Run the InterMap workflow
     return workflow(args)
 
 
@@ -63,7 +51,7 @@ def workflow(args):
     """
     Entry point to run the InterMap workflow.
     """
-    # %%=======================================================================
+    # =========================================================================
     # 1. Start (logging, print logo, set number of threads)
     # =========================================================================
     start_time = time.time()
@@ -77,6 +65,37 @@ def workflow(args):
     # 2. Load the indices & interactions to compute
     # =========================================================================
     iman = IndexManager(args)
+
+    # =========================================================================
+    # 2b. CpHMD patch — MUST happen before unpacking iman attributes.
+    #     patch_index_manager() adds titratable atoms to iman.anions/cations
+    #     and rebuilds aromatic arrays.
+    #     iman.inters_requested is then refreshed so that Anionic/Cationic
+    #     are included now that anions/cations are populated.
+    #     CutoffsManager reads iman.inters_requested, so this must all happen
+    #     before step 3.
+    # =========================================================================
+    cphmd = None
+    if getattr(args, 'lambda_ref', None) and getattr(args, 'lambda_dir', None):
+        from intermap.managers.cphmd import CpHMDManager
+        cphmd = CpHMDManager(
+            lambda_ref_path = args.lambda_ref,
+            lambda_dir      = args.lambda_dir,
+            lambda_glob     = getattr(args, 'lambda_glob',
+                                      '**/eq/*-coord-*.xvg'),
+            traj_frames     = iman.traj_frames,
+            ps_per_frame    = getattr(args, 'lambda_ps_per_frame', 50),
+        )
+        cphmd.patch_index_manager(iman)
+        # Re-evaluate which interactions are possible now that
+        # iman.anions and iman.cations have been populated by the patch.
+        # Without this, Anionic/Cationic remain skipped by get_interactions()
+        # because anions was 0 when IndexManager.__init__ ran it the first time.
+        iman.inters_requested = iman.get_interactions()
+
+    # =========================================================================
+    # Unpack iman attributes AFTER patch so all local variables are current
+    # =========================================================================
     (sel_idx, s1_idx, s2_idx, shared_idx, s1_cat, s2_cat, s1_ani, s2_ani,
      s1_cat_idx, s2_cat_idx, s1_ani_idx, s2_ani_idx, s1_rings, s2_rings,
      s1_rings_idx, s2_rings_idx, s1_aro_idx, s2_aro_idx, xyz_aro_idx,
@@ -106,6 +125,15 @@ def workflow(args):
         cuts.cuts_aro, cuts.cuts_others, cuts.selected_aro,
         cuts.selected_others, cuts.len_aro, cuts.len_others, cuts.max_dist_aro,
         cuts.max_dist_others)
+
+    # Build CpHMD gating helpers now that CutoffsManager is ready
+    ionic_cols  = None
+    atom_lookup = None
+    if cphmd is not None:
+        from intermap.managers.cphmd import CpHMDManager
+        ionic_cols  = CpHMDManager.get_ionic_col_indices(
+            cuts.selected_aro, cuts.selected_others)
+        atom_lookup = cphmd.build_atom_lookup(iman)
 
     # =========================================================================
     # 4. Estimating memory allocation
@@ -137,14 +165,14 @@ def workflow(args):
     self = ContainerManager(args, iman, cuts)
     for i, xyz_chunk in tqdm(enumerate(trajiter),
                              desc='Detecting Interactions',
-                             unit='chunk', total=n_chunks, ):
+                             unit='chunk', total=n_chunks):
 
         # 6.1 Get centroids & coordinates of aromatic rings
         s1_ctrs, s2_ctrs, xyzs_aro = aro.get_aro_xyzs(
             xyz_chunk, s1_rings, s2_rings, s1_cat, s2_cat, s1_ani, s2_ani)
 
         # 6.2 Get the kdtrees of aromatic & non-aromatic coordinates
-        trees_aro = cmn.get_trees(xyzs_aro, s2_aro_idx)
+        trees_aro    = cmn.get_trees(xyzs_aro, s2_aro_idx)
         trees_others = cmn.get_trees(xyz_chunk, s2_idx)
 
         # 6.3 Detect interactions in parallel
@@ -157,8 +185,17 @@ def workflow(args):
             s1_aro_idx, s2_aro_idx, cuts_others, selected_others, cuts_aro,
             selected_aro, overlap, atomic, resconv)
 
+        # 6.35 CpHMD per-frame ionic gating
+        if cphmd is not None and ijf_chunk.shape[0] > 0:
+            ijf_chunk, inters_chunk = cphmd.gate_chunk(
+                ijf_chunk, inters_chunk,
+                contiguous[i],
+                ionic_cols,
+                atom_lookup,
+            )
+
         # 6.4 Update counters
-        total_pairs += ijf_chunk.shape[0]
+        total_pairs  += ijf_chunk.shape[0]
         total_inters += inters_chunk.sum()
 
         # 6.5 Renumber from atom to residue indices if resolution is 'residue'
@@ -177,19 +214,19 @@ def workflow(args):
                            resconv, atomic=atomic)
                 self.fill(ijwf, inters='wb')
 
-    # %%=======================================================================
+    # =========================================================================
     # 7. Save the interactions
     # =========================================================================
     self.rename()
     base_name = f"{basename(args.job_name)}_InterMap.pickle"
-    out_name = join(args.output_dir, base_name)
+    out_name  = join(args.output_dir, base_name)
     gnl.pickle_to_file(self.dict, out_name)
 
-    # %%=======================================================================
+    # =========================================================================
     # 8. Normal termination
     # =========================================================================
-    tot = round(time.time() - start_time, 2)
-    ldict = len(self.dict)
+    tot       = round(time.time() - start_time, 2)
+    ldict     = len(self.dict)
     pair_type = 'atom' if atomic else 'residue'
     logger.info(
         f" Normal termination of InterMap job '{basename(args.job_name)}'\n"

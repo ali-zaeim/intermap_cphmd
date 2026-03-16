@@ -201,7 +201,10 @@ class Config:
         },
 
         # ____ cutoffs
-        'cutoffs': None
+        'cutoffs': None,
+
+        #____ cphmd
+        'cphmd': None,
     }
 
     def __init__(self, mode='production', cfg_path=None):
@@ -339,6 +342,9 @@ class ConfigManager(Config):
         # 4. Parse the annotations
         self.read_annotations()
 
+        # 4.5 Parse CpHMD parameters (optional section)
+        self.parse_cphmd()
+
         # 5. Start logging
         args = self.config_args
         base_name = basename(args['job_name'])
@@ -361,6 +367,18 @@ class ConfigManager(Config):
             f"\n Min prevalence: {args['min_prevalence']}"
             f"\n Resolution: {args['resolution']}\n"
         )
+
+        # Log CpHMD status
+        if args.get('lambda_ref'):
+            logger.info(
+                f"\n CpHMD mode: ENABLED"
+                f"\n Lambda reference: {args['lambda_ref']}"
+                f"\n Lambda directory: {args['lambda_dir']}"
+                f"\n Lambda glob: {args['lambda_glob']}"
+                f"\n Lambda ps/frame: {args['lambda_ps_per_frame']}\n"
+            )
+        else:
+            logger.info(f"\n CpHMD mode: DISABLED\n")
 
     def build_dir_hierarchy(self):
         """
@@ -457,6 +475,75 @@ class ConfigManager(Config):
                         f'"interactions" section of the config file. The value'
                         f' must be set either to False or to a valid path. The'
                         f' provided value was: {raw_value}.\n')
+                
+    def parse_cphmd(self):
+        """
+        Parse the optional [cphmd] section.
+ 
+        If the section is absent, sets all four keys to None/defaults so
+        that runner.py's getattr(args, 'lambda_ref', None) check works
+        correctly and CpHMD gating is simply skipped.
+ 
+        Keys
+        ----
+        lambda_ref          : path to the lambda reference file (required if
+                              section present)
+        lambda_dir          : base directory containing .xvg files (required
+                              if section present)
+        lambda_glob         : glob pattern to find .xvg files
+                              (default: '**/eq/*-coord-*.xvg')
+        lambda_ps_per_frame : picoseconds per trajectory frame (default: 50)
+        """
+        # Section absent — set sentinel Nones and return
+        if 'cphmd' not in self.config_obj:
+            self.config_args.update({
+                'lambda_ref':          None,
+                'lambda_dir':          None,
+                'lambda_glob':         '**/eq/*-coord-*.xvg',
+                'lambda_ps_per_frame': 50,
+            })
+            return
+ 
+        section = self.config_obj['cphmd']
+        cfg_dir = dirname(self.config_path)
+ 
+        # ---- lambda_ref (required if section present) ----
+        raw_ref = section.get('lambda_ref', '').strip()
+        if not raw_ref:
+            raise KeyError(
+                '"lambda_ref" is required in the [cphmd] section.')
+        abs_ref = raw_ref if isabs(raw_ref) else normpath(join(cfg_dir, raw_ref))
+        cmn.check_path(abs_ref, check_exist=True)
+ 
+        # ---- lambda_dir (required if section present) ----
+        raw_dir = section.get('lambda_dir', '').strip()
+        if not raw_dir:
+            raise KeyError(
+                '"lambda_dir" is required in the [cphmd] section.')
+        abs_dir = raw_dir if isabs(raw_dir) else normpath(join(cfg_dir, raw_dir))
+        cmn.check_path(abs_dir, check_exist=True)
+ 
+        # ---- lambda_glob (optional, has default) ----
+        lambda_glob = section.get(
+            'lambda_glob', '**/eq/*-coord-*.xvg').strip()
+ 
+        # ---- lambda_ps_per_frame (optional, has default) ----
+        raw_ps = section.get('lambda_ps_per_frame', '50').strip()
+        try:
+            lambda_ps_per_frame = int(raw_ps)
+            if lambda_ps_per_frame < 1:
+                raise ValueError
+        except ValueError:
+            raise ValueError(
+                f'"lambda_ps_per_frame" must be a positive integer, '
+                f'got: {raw_ps}')
+ 
+        self.config_args.update({
+            'lambda_ref':          abs_ref,
+            'lambda_dir':          abs_dir,
+            'lambda_glob':         lambda_glob,
+            'lambda_ps_per_frame': lambda_ps_per_frame,
+        })
 
 # %%===========================================================================
 # Debugging area
