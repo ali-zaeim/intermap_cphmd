@@ -127,11 +127,11 @@ def workflow(args):
         cuts.max_dist_others)
 
     # Build CpHMD gating helpers now that CutoffsManager is ready
-    ionic_cols  = None
+    gating_cols = None
     atom_lookup = None
     if cphmd is not None:
         from intermap.managers.cphmd import CpHMDManager
-        ionic_cols  = CpHMDManager.get_ionic_col_indices(
+        gating_cols = CpHMDManager.get_gating_col_indices(
             cuts.selected_aro, cuts.selected_others)
         atom_lookup = cphmd.build_atom_lookup(iman)
 
@@ -185,12 +185,12 @@ def workflow(args):
             s1_aro_idx, s2_aro_idx, cuts_others, selected_others, cuts_aro,
             selected_aro, overlap, atomic, resconv)
 
-        # 6.35 CpHMD per-frame ionic gating
+        # 6.35 CpHMD per-frame state-aware gating
         if cphmd is not None and ijf_chunk.shape[0] > 0:
             ijf_chunk, inters_chunk = cphmd.gate_chunk(
                 ijf_chunk, inters_chunk,
                 contiguous[i],
-                ionic_cols,
+                gating_cols,
                 atom_lookup,
             )
 
