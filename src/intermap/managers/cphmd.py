@@ -15,12 +15,16 @@ Column layout of inters_chunk (mirrors ContainerManager.get_inter_names):
   selected_others before indexing.
 
 Lambda convention (GROMACS CpHMD, this force field):
-  lambda < 0.5  ->  protonated
-  lambda >= 0.5 ->  deprotonated
+  ASPT / GLUT:
+    lambda < 0.5  -> protonated
+    lambda >= 0.5 -> deprotonated
 
-  ASPT / GLUT:  deprot -> anionic
-  HSPT state 1: prot   -> cationic  (doubly protonated)
-  HSPT state 2/3: tautomer only, never ionic
+  HSPT state 1:
+    lambda >= 0.5 -> protonated
+    lambda < 0.5  -> deprotonated
+
+  HSPT state 2/3:
+    tautomer coordinates only, never ionic
 
 Trajectory / lambda alignment:
   frame f  <->  lambda window [f*50 : (f+1)*50] ps, mean of window used.
@@ -206,6 +210,15 @@ class CpHMDManager:
             grouped.setdefault(entry['resid'], []).append(entry)
         return grouped
 
+    @staticmethod
+    def _get_protonation_masks(resname, state, frame_lam):
+        if resname == HISTIDINE_RESNAME and state == HSPT_CATION_STATE:
+            is_protonated = frame_lam >= CHARGE_CUTOFF
+        else:
+            is_protonated = frame_lam < CHARGE_CUTOFF
+        is_deprot = ~is_protonated
+        return is_protonated, is_deprot
+
     def _load_all(self):
         site_entries = []
         for _, row in self.ref.iterrows():
@@ -227,8 +240,8 @@ class CpHMDManager:
             lam_ps = parse_lambda_xvg(xvg)
             frame_lam = build_frame_lambda(lam_ps, self.n_frames,
                                            self.ps_per_frame)
-            is_deprot = frame_lam >= CHARGE_CUTOFF
-            is_protonated = ~is_deprot
+            is_protonated, is_deprot = self._get_protonation_masks(
+                resname, state, frame_lam)
 
             if resname in ACIDIC_RESNAMES:
                 is_charged = is_deprot

@@ -11,6 +11,26 @@ def empty_cols():
     return np.array([], dtype=np.int32)
 
 
+def test_get_protonation_masks_keeps_default_cutoff_for_acidic_sites():
+    frame_lam = np.array([0.2, 0.5, 0.8], dtype=np.float32)
+
+    is_protonated, is_deprotonated = CpHMDManager._get_protonation_masks(
+        'ASPT', 1, frame_lam)
+
+    assert is_protonated.tolist() == [True, False, False]
+    assert is_deprotonated.tolist() == [False, True, True]
+
+
+def test_get_protonation_masks_inverts_cutoff_for_histidine_state_1():
+    frame_lam = np.array([0.2, 0.5, 0.8], dtype=np.float32)
+
+    is_protonated, is_deprotonated = CpHMDManager._get_protonation_masks(
+        'HSPT', 1, frame_lam)
+
+    assert is_protonated.tolist() == [False, True, True]
+    assert is_deprotonated.tolist() == [True, False, False]
+
+
 def test_gate_chunk_suppresses_ionic_only():
     manager = make_manager()
 
