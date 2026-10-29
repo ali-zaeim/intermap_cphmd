@@ -266,9 +266,15 @@ class ContainerManager:
         """
         shared = self.iman.shared_idx
         new_dict = {}
-        compressed = is_compressed(self.dict)
+        compressed = self.detect_wb
 
         for key, value in self.dict.items():
+            # Skip the interactions below the minimum prevalence (%)
+            if self.min_prevalence > 0:
+                bits = bu.sc_decode(value) if compressed else value
+                if bits.count(1) * 100 < self.min_prevalence * self.n_frames:
+                    continue
+
             # Compress the time series to a bitarray if not already done
             time = bu.sc_encode(value) if not compressed else value
 

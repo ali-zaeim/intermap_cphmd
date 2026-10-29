@@ -369,14 +369,21 @@ class ConfigManager(Config):
         # 4. Parse the annotations
         self.read_annotations()
 
-        n_procs = self.config_args.get('n_procs')
-        numba.set_num_threads(n_procs)
-
         # 5. Start logging
         args = self.config_args
         base_name = basename(args['job_name'])
         log_path = join(args['output_dir'], f"{base_name}_InterMap.log")
         logger = start_logger(log_path)
+
+        # 6. Set the number of threads (Numba can't exceed its maximum)
+        n_procs = self.config_args.get('n_procs')
+        max_procs = numba.config.NUMBA_NUM_THREADS
+        if n_procs > max_procs:
+            logger.warning(
+                f"Requested n_procs={n_procs} exceeds the {max_procs} threads "
+                f"available. Using {max_procs} instead.")
+            n_procs = max_procs
+        numba.set_num_threads(n_procs)
 
         value = args['trajectory']
         ntrajs = 'Trajectory' if len(value.split(',')) == 1 else 'Trajectories'

@@ -30,12 +30,12 @@ def runpar(
     ijf_template.fill(0)
     inters_template.fill(False)
 
-    dist_cut1 = max(cuts_others[:2].max(), max_vdw)
-    dist_cut2 = cuts_aro[:2].max()
+    # Cutoff arrays are empty when no interaction of that family is requested
+    dist_cut1 = max(cuts_others[:2].max(), max_vdw) if cuts_others.size else 0.0
+    dist_cut2 = cuts_aro[:2].max() if cuts_aro.size else 0.0
 
     # Iterate over the frames in the chunk
-    len_aro = len(selected_aro)
-    len_others = len(selected_others)
+    len_aro = 0 if 'None' in selected_aro else len(selected_aro)
     for i in prange(dim1):
         j = np.int32(i)
 
@@ -76,7 +76,7 @@ def runpar(
         inters_template[j][:num_aros, :len_aro] = inters_aro[:num_aros,
                                                   :len_aro]
         inters_template[j][num_aros:num_aros + num_others,
-        -len_others:] = inters_others
+        len_aro:] = inters_others
 
     ijf_template = ijf_template.reshape(-1, 3)
     inters_template = inters_template.reshape(-1, inters_shape[1])
@@ -91,14 +91,16 @@ def estimate(
         s1_aro_idx, s2_aro_idx, cuts_aro, selected_aro, len_aro, anions,
         hydroph, met_don, met_acc, vdw_radii, hb_hydr, hb_don, hb_acc, xb_hal,
         xb_don, xb_acc, cuts_others, selected_others, len_others, max_dist_aro,
-        max_dist_others, overlap, atomic, resconv, factor=1.5, n_samples=10):
+        max_dist_others, overlap, atomic, resconv, sel_idx, traj_frames,
+        factor=1.5, n_samples=10):
 
-    # Get the samples coordinates along the trajectory
-    n_frames = universe.trajectory.n_frames
-    step = max(1, n_frames // n_samples)
-    sub = universe.trajectory[::step]
-    positions = np.asarray([ts.positions.copy() for ts in sub],
-                           dtype=np.float32)
+    # Get the samples coordinates of the selected atoms along the frames to
+    # process (indices of the selections are relative to sel_idx)
+    step = max(1, traj_frames.size // n_samples)
+    sampled = traj_frames[::step] if traj_frames.size else np.zeros(1, int)
+    positions = np.asarray(
+        [universe.trajectory[f].positions[sel_idx] for f in sampled],
+        dtype=np.float32)
 
     # Detect the number of interactions
     N = len(positions)

@@ -238,8 +238,8 @@ class IndexManager:
         'xb_don': '[#6,#7,Si,F,Cl,Br,I]-[Cl,Br,I,At]',
         'cations': '[+{1-},$([NX3&!$([NX3]-O)]-[C]=[NX3+])]',
         'anions': '[-{1-},$(O=[C,S,P]-[O-])]',
-        'rings5': '[a;r5]1:[a;r5]:[a;r5]:[a;r5]:[a;r5]:1',
-        'rings6': '[a;r6]1:[a;r6]:[a;r6]:[a;r6]:[a;r6]:[a;r6]:1',
+        'rings5': '[a]1:[a]:[a]:[a]:[a]:1',
+        'rings6': '[a]1:[a]:[a]:[a]:[a]:[a]:1',
         'metal_don': '[Ca,Cd,Co,Cu,Fe,Mg,Mn,Ni,Zn]',
         'metal_acc': '[O,#7&!$([nX3])&!$([NX3]-*=[!#6])&!$([NX3]-[a])&!$([NX4]),-{1-};!+{1-}]',
 
@@ -546,12 +546,19 @@ class IndexManager:
         hx_H_raw = npi.indices(self.sel_idx, np.asarray(hx_H), missing=-1)
         hx_A_raw = npi.indices(self.sel_idx, np.asarray(hx_A), missing=-1)
 
-        hx_D = hx_D_raw[hx_D_raw != -1].astype(np.int32)
-        hx_H = hx_H_raw[hx_H_raw != -1].astype(np.int32)
-        hx_A = np.unique(hx_A_raw[hx_A_raw != -1]).astype(np.int32)
+        # Keep donor-hydrogen pairs only if both atoms are selected, so that
+        # the two arrays stay aligned pair by pair
+        d_in, h_in = hx_D_raw != -1, hx_H_raw != -1
+        n_partial = (d_in ^ h_in).sum()
+        if n_partial:
+            logger.warning(
+                f"{n_partial} '{donor_identifier}' pairs have only one of "
+                f"their two atoms selected and will be ignored.")
+        paired = d_in & h_in
 
-        assert len(hx_D) == len(
-            hx_H), f"Donors ({hx_D.size}) and Hydrogens ({hx_H.size}) do not match"
+        hx_D = hx_D_raw[paired].astype(np.int32)
+        hx_H = hx_H_raw[paired].astype(np.int32)
+        hx_A = np.unique(hx_A_raw[hx_A_raw != -1]).astype(np.int32)
         return hx_D, hx_H, hx_A
 
     def get_rings(self):
@@ -573,12 +580,15 @@ class IndexManager:
                 query = Chem.MolFromSmarts(smart)
                 match = [list(x) for x in tri_mol.GetSubstructMatches(query)]
                 if match:
+                    # Keep each ring (one per match) lying in this residue
                     where_dh = tri_res.atoms.resindices[match] == case
-                    selected_dh = tri_res.atoms.indices[match][where_dh]
-                    if selected_dh.any():
-                        rings.append(selected_dh)
+                    selected_dh = tri_res.atoms.indices[match][
+                        where_dh.all(axis=1)]
+                    for ring in selected_dh:
+                        rings.append(ring)
 
         # Look for rings in the disconnected residues
+        unk_str = ' '.join(self.unknown)
         for case in self.rdk_disconnected:
             mono_mol = self.rdk_disconnected[case]
             for smart in patterns:
@@ -587,10 +597,11 @@ class IndexManager:
                 if match:
                     for similar in self.uniq_disconnected[case]:
                         mono_res = self.universe.residues[similar]
-                        selected = mono_res.atoms.indices[match]
-                        if selected.any():
-                            for ring in selected:
-                                rings.append(ring)
+                        known_atoms = mono_res.atoms.select_atoms(
+                            f"not name {unk_str}") if unk_str else mono_res.atoms
+                        selected = known_atoms.indices[match]
+                        for ring in selected:
+                            rings.append(ring)
 
         # Pad rings with -1
         padded_rings = np.full((len(rings), 7), dtype=np.int32, fill_value=-1)
@@ -620,8 +631,11 @@ class IndexManager:
             s2_aro_idx (ndarray): Indices of the atoms in selection 2 that are in aromatic interactions
             xyz_aro_idx (ndarray): Indices of the atoms in the universe that are in aromatic interactions
         """
+        # Keep only the rings whose atoms are all selected
         rings_raw = self.get_rings()
-        rings = rings_raw[rings_raw[:, 0] != -1]
+        complete = np.asarray([(x[:x[-1]] != -1).all() for x in rings_raw],
+                              dtype=bool)
+        rings = rings_raw[complete]
         s1_cat = self.s1_idx[geom.isin(self.s1_idx, self.cations)]
         s2_cat = self.s2_idx[geom.isin(self.s2_idx, self.cations)]
         s1_ani = self.s1_idx[geom.isin(self.s1_idx, self.anions)]

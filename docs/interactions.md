@@ -196,7 +196,7 @@ Cation–π interactions occur between a positively charged ion (cation) and the
       **SMARTS**
         ```
         Cation: [+{1-},$([NX3&!$([NX3]-O)]-[C]=[NX3+])]
-        Aromatic: [a;r6]1:[a;r6]:[a;r6]:[a;r6]:[a;r6]:[a;r6]:1
+        Aromatic: [a]1:[a]:[a]:[a]:[a]:[a]:1
         ```
   
     **Example**  
@@ -221,8 +221,8 @@ Anion–π interactions occur between a negatively charged ion (anion) and the e
       **SMARTS**
         ```
         Anion: [-{1-},$(O=[C,S,P]-[O-])]
-        Aromatic ring (6-members): [a;r6]1:[a;r6]:[a;r6]:[a;r6]:[a;r6]:[a;r6]:1
-        Aromatic ring (5-members): [a;r5]1:[a;r5]:[a;r5]:[a;r5]:[a;r5]:1
+        Aromatic ring (6-members): [a]1:[a]:[a]:[a]:[a]:[a]:1
+        Aromatic ring (5-members): [a]1:[a]:[a]:[a]:[a]:1
         ```
   
     **Example**  
@@ -249,8 +249,8 @@ Face-to-face π–π stacking interactions occur between two aromatic rings that
     
     **SMARTS**
       ```
-      Aromatic ring (6-members): [a;r6]1:[a;r6]:[a;r6]:[a;r6]:[a;r6]:[a;r6]:1
-      Aromatic ring (5-members): [a;r5]1:[a;r5]:[a;r5]:[a;r5]:[a;r5]:1
+      Aromatic ring (6-members): [a]1:[a]:[a]:[a]:[a]:[a]:1
+      Aromatic ring (5-members): [a]1:[a]:[a]:[a]:[a]:1
       ```
     
     **Example**  
@@ -274,8 +274,8 @@ Edge-to-face π–π stacking interactions occur between two aromatic rings that
     
     **SMARTS**
       ```
-      Aromatic ring (6-members): [a;r6]1:[a;r6]:[a;r6]:[a;r6]:[a;r6]:[a;r6]:1
-      Aromatic ring (5-members): [a;r5]1:[a;r5]:[a;r5]:[a;r5]:[a;r5]:1
+      Aromatic ring (6-members): [a]1:[a]:[a]:[a]:[a]:[a]:1
+      Aromatic ring (5-members): [a]1:[a]:[a]:[a]:[a]:1
       ```
     **Example**  
     <div align="center">

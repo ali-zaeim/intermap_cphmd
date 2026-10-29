@@ -164,7 +164,7 @@ def stackings(inter_name, ring_dists, n1n2, n1c1c2, n2c2c1, idists,
     if inter_name == 'FaceToFace':
         iradius = np.inf
     elif inter_name == 'EdgeToFace':
-        iradius = 1.5
+        iradius = cuts_aro[1, idx]
     elif inter_name == 'PiStacking':
         iradius = np.inf
     else:
@@ -206,10 +206,7 @@ def aro(
     row2 = ijf_aro[:, 1]
     inters_aro = np.zeros((row1.shape[0], len(selected_aro)), dtype=np.bool_)
 
-    if 'None' in selected_aro:
-        return ijf_aro, inters_aro
-
-    if ijf_aro.shape[0] == 0:
+    if ('None' in selected_aro) or (ijf_aro.shape[0] == 0):
         return np.zeros((0, 3), dtype=np.int32), np.zeros(
             (0, len(selected_aro)), dtype=np.bool_)
 

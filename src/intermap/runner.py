@@ -112,13 +112,15 @@ def workflow(args):
         cuts_aro, selected_aro, len_aro, anions, hydroph, met_don, met_acc,
         vdw_radii, hb_hydr, hb_don, hb_acc, xb_hal, xb_don, xb_acc,
         cuts_others, selected_others, len_others, max_dist_aro,
-        max_dist_others, overlap, atomic, resconv)
+        max_dist_others, overlap, atomic, resconv, sel_idx, traj_frames,
+        factor=getattr(args, 'n_factor', 1.5),
+        n_samples=getattr(args, 'n_samples', 10))
 
     # =========================================================================
     # 5. Trim the trajectory
     # =========================================================================
     chunk_frames = list(cmn.split_in_chunks(traj_frames, args.chunk_size))
-    n_chunks = traj_frames.size // args.chunk_size
+    n_chunks = len(chunk_frames)
     trajiter = cmn.trajiter(universe, chunk_frames, sel_idx)
     contiguous = list(cmn.split_in_chunks(np.arange(traj_frames.size),
                                           args.chunk_size))

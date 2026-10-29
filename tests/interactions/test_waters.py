@@ -16,7 +16,8 @@ class TestWatersLogic:
         waters = np.array([10, 11], dtype=np.int32) # Waters are indices 10, 11
         idxs = [0, 1]
 
-        res = wb1(ijf_chunk, inters_chunk, waters, idxs, resconv=None, atomic=True)
+        res = wb1(ijf_chunk, inters_chunk, waters, idxs,
+                  resconv=np.arange(20, dtype=np.int32), atomic=True)
         assert res.shape == (0, 4)
 
     def test_wb1_no_doubles(self):
@@ -27,7 +28,8 @@ class TestWatersLogic:
         waters = np.array([10], dtype=np.int32)
         idxs = [0, 1]
 
-        res = wb1(ijf_chunk, inters_chunk, waters, idxs, resconv=None, atomic=True)
+        res = wb1(ijf_chunk, inters_chunk, waters, idxs,
+                  resconv=np.arange(20, dtype=np.int32), atomic=True)
         assert res.shape == (0, 4) # No bridges formed
 
     def test_wb1_standard_bridge(self):
@@ -53,7 +55,8 @@ class TestWatersLogic:
         waters = np.array([10], dtype=np.int32)
         idxs = [0, 1]
 
-        res = wb1(ijf_chunk, inters_chunk, waters, idxs, resconv=None, atomic=True)
+        res = wb1(ijf_chunk, inters_chunk, waters, idxs,
+                  resconv=np.arange(20, dtype=np.int32), atomic=True)
 
         # 3 atoms connected to the same water -> 3 combinations
         assert res.shape == (3, 4)

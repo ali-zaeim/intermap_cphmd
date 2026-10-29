@@ -105,7 +105,8 @@ class TestCutoffsManager:
         assert list(cm.selected_aro) != ['None']
 
         assert cm.len_others == 0
-        assert cm.len_aro == 2
+        # PiStacking also requires EdgeToFace, which is added automatically
+        assert cm.len_aro == 3
 
         assert cm.max_dist_others == 0
         assert cm.max_dist_aro > 0
@@ -135,7 +136,8 @@ class TestCutoffsManager:
 
         assert 'Hydrophobic' in cm.selected_others
         assert 'PiStacking' in cm.selected_aro
-        assert cm.len_aro == 1
+        # PiStacking also requires FaceToFace & EdgeToFace (added automatically)
+        assert cm.len_aro == 3
         assert cm.len_others == 1
 
     def test_water_bridge_coverage(self, base_args):
