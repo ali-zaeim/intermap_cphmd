@@ -17,46 +17,41 @@ def wb1(ijf_chunk, inters_chunk, waters, idxs, resconv, atomic=True):
     j_is_wat = geom.isin(ijf_chunk[:, 1], waters)
 
     # Select the rows that have at least one water, that is connected by a hb
-
     a1_xor_a2 = i_is_wat ^ j_is_wat
-    hb_inters = inters_chunk[:, idxs[0]] | inters_chunk[:, idxs[1]]
+    hb_inters = inters_chunk[:, idxs].any(axis=1)
     selected = a1_xor_a2 & hb_inters
-    i_is_wat = i_is_wat[selected]
-    j_is_wat = j_is_wat[selected]
-    ijf_wat = ijf_chunk[selected]
-
-    # Swap the rows to have the water in the first column
-    t1_i = ijf_wat[i_is_wat][:, 0]
-    t1_j = ijf_wat[i_is_wat][:, 1]
-    t2_i = ijf_wat[j_is_wat][:, 1]
-    t2_j = ijf_wat[j_is_wat][:, 0]
-    i_len = t1_i.size
-
-    ijf_wat[:i_len, 0] = t1_i
-    ijf_wat[i_len:, 0] = t2_i
-    ijf_wat[:i_len, 1] = t1_j
-    ijf_wat[i_len:, 1] = t2_j
-
-    # Group the interactions by the water atoms
-    if ijf_wat.size == 0:
+    if not selected.any():
         return np.zeros((0, 4), dtype=np.int32)
 
+    # Swap the rows to have the water in the first column (frames untouched)
+    ijf_wat = ijf_chunk[selected]
+    swap = j_is_wat[selected]
+    ijf_wat[swap, 0], ijf_wat[swap, 1] = ijf_wat[swap, 1], ijf_wat[swap, 0]
+
+    # In atomic resolution, identify each water molecule by its first atom so
+    # that bridges through its different atoms (O, H) are grouped together
+    if atomic:
+        wat_res, first_atom = npi.group_by(resconv[waters]).min(waters)
+        where = npi.indices(wat_res, resconv[ijf_wat[:, 0]])
+        ijf_wat[:, 0] = first_atom[where]
+
+    # Group the interactions by the water molecules
     groups = npi.group_by(ijf_wat[:, [0, 2]])
     sorter = groups.index.sorter
     slices = groups.index.slices
     indices = np.split(sorter, slices[1:-1])
 
-    # Get the interactions that have more than one water
-    doubles = [x for x in indices if len(x) > 1]
-    sizes = [int(len(x) * (len(x) - 1) / 2) for x in doubles]
-    ijkf = np.empty((sum(sizes), 4), dtype=np.int32)
-    c = 0
-    for i, double in enumerate(doubles):
-        section = ijf_wat[double]
+    # Get the pairs of different residues bridged by the same water
+    ijkf = []
+    for index in indices:
+        section = ijf_wat[index]
         k = section[0][0]
         f = section[0][2]
-        combinations = list(it.combinations(section[:, 1], 2))
-        for (v, j) in combinations:
-            ijkf[c] = (v, j, k, f)
-            c += 1
-    return ijkf
+        for (v, j) in it.combinations(np.unique(section[:, 1]), 2):
+            if atomic and resconv[v] == resconv[j]:
+                continue
+            ijkf.append((v, j, k, f))
+
+    if not ijkf:
+        return np.zeros((0, 4), dtype=np.int32)
+    return np.asarray(ijkf, dtype=np.int32)

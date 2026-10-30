@@ -258,8 +258,18 @@ class CutoffsManager:
             cutoffs_others (ndarray): Cutoffs for the non-aromatic interactions
         """
 
-        inters_requested = self.iman.inters_requested
+        inters_requested = list(self.iman.inters_requested)
         inters_internal = self.inters_internal
+
+        # PiStacking is derived from FaceToFace | EdgeToFace, so both are needed
+        if 'PiStacking' in inters_requested:
+            missing = [x for x in ('FaceToFace', 'EdgeToFace') if
+                       x not in inters_requested]
+            if missing:
+                logger.warning(
+                    f"PiStacking is computed as FaceToFace | EdgeToFace. "
+                    f"Adding the missing interactions: {missing}")
+                inters_requested.extend(missing)
 
         # Parse aromatics
         bit_aro = [y for x in inters_requested if re.search(r'Pi|Face', x) for

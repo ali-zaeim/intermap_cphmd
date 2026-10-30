@@ -8,7 +8,6 @@ from argparse import Namespace
 from os.path import basename, join
 
 import numpy as np
-from numba import set_num_threads
 from rgpack import generals as gnl
 from tqdm import tqdm
 
@@ -56,7 +55,6 @@ def workflow(args):
     # =========================================================================
     start_time = time.time()
     logger = logging.getLogger('InterMapLogger')
-    set_num_threads(args.n_procs)
 
     if isinstance(args, dict):
         args = Namespace(**args)
@@ -147,13 +145,15 @@ def workflow(args):
         cuts_aro, selected_aro, len_aro, anions, hydroph, met_don, met_acc,
         vdw_radii, hb_hydr, hb_don, hb_acc, xb_hal, xb_don, xb_acc,
         cuts_others, selected_others, len_others, max_dist_aro,
-        max_dist_others, overlap, atomic, resconv)
+        max_dist_others, overlap, atomic, resconv, sel_idx, traj_frames,
+        factor=getattr(args, 'n_factor', 1.5),
+        n_samples=getattr(args, 'n_samples', 10))
 
     # =========================================================================
     # 5. Trim the trajectory
     # =========================================================================
     chunk_frames = list(cmn.split_in_chunks(traj_frames, args.chunk_size))
-    n_chunks = traj_frames.size // args.chunk_size
+    n_chunks = len(chunk_frames)
     trajiter = cmn.trajiter(universe, chunk_frames, sel_idx)
     contiguous = list(cmn.split_in_chunks(np.arange(traj_frames.size),
                                           args.chunk_size))
@@ -162,7 +162,7 @@ def workflow(args):
     # 6. Detect the interactions & Fill the container
     # =========================================================================
     total_pairs, total_inters = 0, 0
-    self = ContainerManager(args, iman, cuts)
+    cm = ContainerManager(args, iman, cuts)
     for i, xyz_chunk in tqdm(enumerate(trajiter),
                              desc='Detecting Interactions',
                              unit='chunk', total=n_chunks):
@@ -206,27 +206,27 @@ def workflow(args):
         frames = contiguous[i]
         if ijf_chunk.shape[0] > 0:
             ijf_chunk[:, 2] = frames[ijf_chunk[:, 2]]
-            self.fill(ijf_chunk, inters_chunk)
+            cm.fill(ijf_chunk, inters_chunk)
 
             # 6.7 Fill the container with the water bridges
-            if self.detect_wb:
-                ijwf = wb1(ijf_chunk, inters_chunk, waters, self.hb_idx,
+            if cm.detect_wb:
+                ijwf = wb1(ijf_chunk, inters_chunk, waters, cm.hb_idx,
                            resconv, atomic=atomic)
-                self.fill(ijwf, inters='wb')
+                cm.fill(ijwf, inters='wb')
 
     # =========================================================================
     # 7. Save the interactions
     # =========================================================================
-    self.rename()
+    cm.rename()
     base_name = f"{basename(args.job_name)}_InterMap.pickle"
-    out_name  = join(args.output_dir, base_name)
-    gnl.pickle_to_file(self.dict, out_name)
+    out_name = join(args.output_dir, base_name)
+    gnl.pickle_to_file(cm.dict, out_name)
 
     # =========================================================================
     # 8. Normal termination
     # =========================================================================
-    tot       = round(time.time() - start_time, 2)
-    ldict     = len(self.dict)
+    tot = round(time.time() - start_time, 2)
+    ldict = len(cm.dict)
     pair_type = 'atom' if atomic else 'residue'
     logger.info(
         f" Normal termination of InterMap job '{basename(args.job_name)}'\n"
@@ -234,7 +234,7 @@ def workflow(args):
         f" Total number of interactions detected: {total_inters}\n"
         f" Interactions saved in {out_name} (binary format)\n"
         f" Elapsed time: {tot} s")
-    return self.dict
+    return cm.dict
 
 
 # =============================================================================
