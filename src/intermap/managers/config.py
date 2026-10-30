@@ -11,6 +11,7 @@ import numpy as np
 
 import intermap.commons as cmn
 import intermap.managers.cutoffs as cf
+from intermap.managers.cphmd import DEFAULT_LAMBDA_GLOB, HSPT_STATES
 
 inf_int = sys.maxsize
 inf_float = float(inf_int)
@@ -415,7 +416,9 @@ class ConfigManager(Config):
                 f"\n Lambda reference: {args['lambda_ref']}"
                 f"\n Lambda directory: {args['lambda_dir']}"
                 f"\n Lambda glob: {args['lambda_glob']}"
-                f"\n Lambda ps/frame: {args['lambda_ps_per_frame']}\n"
+                f"\n Lambda ps/frame: "
+                f"{args['lambda_ps_per_frame'] or 'trajectory time step'}"
+                f"\n HSPT states 1-3: {', '.join(args['hspt_states'])}\n"
             )
         else:
             logger.info(f"\n CpHMD mode: DISABLED\n")
@@ -519,11 +522,11 @@ class ConfigManager(Config):
     def parse_cphmd(self):
         """
         Parse the optional [cphmd] section.
- 
-        If the section is absent, sets all four keys to None/defaults so
+
+        If the section is absent, sets all the keys to None/defaults so
         that runner.py's getattr(args, 'lambda_ref', None) check works
         correctly and CpHMD gating is simply skipped.
- 
+
         Keys
         ----
         lambda_ref          : path to the lambda reference file (required if
@@ -531,22 +534,34 @@ class ConfigManager(Config):
         lambda_dir          : base directory containing .xvg files (required
                               if section present)
         lambda_glob         : glob pattern to find .xvg files
-                              (default: '**/eq/*-coord-*.xvg')
-        lambda_ps_per_frame : picoseconds per trajectory frame (default: 50)
+                              (default: '**/*-coord-*.xvg')
+        lambda_ps_per_frame : picoseconds per trajectory frame (default: the
+                              time step of the trajectory)
+        hspt_states         : tautomer of HSPT lambda states 1, 2, 3
+                              (default: HSP, HSE, HSD)
         """
         # Section absent — set sentinel Nones and return
         if 'cphmd' not in self.config_obj:
             self.config_args.update({
                 'lambda_ref':          None,
                 'lambda_dir':          None,
-                'lambda_glob':         '**/eq/*-coord-*.xvg',
-                'lambda_ps_per_frame': 50,
+                'lambda_glob':         DEFAULT_LAMBDA_GLOB,
+                'lambda_ps_per_frame': None,
+                'hspt_states':         HSPT_STATES,
             })
             return
- 
+
         section = self.config_obj['cphmd']
         cfg_dir = dirname(self.config_path)
- 
+
+        allowed = {'lambda_ref', 'lambda_dir', 'lambda_glob',
+                   'lambda_ps_per_frame', 'hspt_states'}
+        unknown = set(section.keys()) - allowed
+        if unknown:
+            raise KeyError(
+                f'Keys {sorted(unknown)} are forbidden in the [cphmd] '
+                f'section. Allowed keys: {sorted(allowed)}.')
+
         # ---- lambda_ref (required if section present) ----
         raw_ref = section.get('lambda_ref', '').strip()
         if not raw_ref:
@@ -554,7 +569,7 @@ class ConfigManager(Config):
                 '"lambda_ref" is required in the [cphmd] section.')
         abs_ref = raw_ref if isabs(raw_ref) else normpath(join(cfg_dir, raw_ref))
         cmn.check_path(abs_ref, check_exist=True)
- 
+
         # ---- lambda_dir (required if section present) ----
         raw_dir = section.get('lambda_dir', '').strip()
         if not raw_dir:
@@ -562,27 +577,39 @@ class ConfigManager(Config):
                 '"lambda_dir" is required in the [cphmd] section.')
         abs_dir = raw_dir if isabs(raw_dir) else normpath(join(cfg_dir, raw_dir))
         cmn.check_path(abs_dir, check_exist=True)
- 
+
         # ---- lambda_glob (optional, has default) ----
-        lambda_glob = section.get(
-            'lambda_glob', '**/eq/*-coord-*.xvg').strip()
- 
-        # ---- lambda_ps_per_frame (optional, has default) ----
-        raw_ps = section.get('lambda_ps_per_frame', '50').strip()
-        try:
-            lambda_ps_per_frame = int(raw_ps)
-            if lambda_ps_per_frame < 1:
-                raise ValueError
-        except ValueError:
-            raise ValueError(
-                f'"lambda_ps_per_frame" must be a positive integer, '
-                f'got: {raw_ps}')
- 
+        lambda_glob = section.get('lambda_glob', DEFAULT_LAMBDA_GLOB).strip()
+
+        # ---- lambda_ps_per_frame (optional, trajectory time step) ----
+        raw_ps = section.get('lambda_ps_per_frame', '').strip()
+        lambda_ps_per_frame = None
+        if raw_ps:
+            try:
+                lambda_ps_per_frame = float(raw_ps)
+                if lambda_ps_per_frame <= 0:
+                    raise ValueError
+            except ValueError:
+                raise ValueError(
+                    f'"lambda_ps_per_frame" must be a positive number, '
+                    f'got: {raw_ps}')
+
+        # ---- hspt_states (optional, has default) ----
+        raw_states = section.get('hspt_states', '').strip()
+        hspt_states = HSPT_STATES
+        if raw_states:
+            hspt_states = tuple(x.strip() for x in raw_states.split(','))
+            if sorted(hspt_states) != sorted(HSPT_STATES):
+                raise ValueError(
+                    f'"hspt_states" must list {sorted(HSPT_STATES)} in the '
+                    f'order of the HSPT lambda states, got: {raw_states}')
+
         self.config_args.update({
             'lambda_ref':          abs_ref,
             'lambda_dir':          abs_dir,
             'lambda_glob':         lambda_glob,
             'lambda_ps_per_frame': lambda_ps_per_frame,
+            'hspt_states':         hspt_states,
         })
 
 # %%===========================================================================

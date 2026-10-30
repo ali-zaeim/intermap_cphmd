@@ -17,6 +17,7 @@ from intermap.interactions.runners import estimate, runpar
 from intermap.interactions.waters import wb1
 from intermap.managers.config import ConfigManager
 from intermap.managers.container import ContainerManager
+from intermap.managers.cphmd import register_protein_resnames
 from intermap.managers.cutoffs import CutoffsManager
 from intermap.managers.indices import IndexManager
 
@@ -62,12 +63,13 @@ def workflow(args):
     # =========================================================================
     # 2. Load the indices & interactions to compute
     # =========================================================================
+    register_protein_resnames()
     iman = IndexManager(args)
 
     # =========================================================================
     # 2b. CpHMD patch — MUST happen before unpacking iman attributes.
     #     patch_index_manager() adds titratable atoms to iman.anions/cations
-    #     and rebuilds aromatic arrays.
+    #     and acceptors, and rebuilds aromatic arrays.
     #     iman.inters_requested is then refreshed so that Anionic/Cationic
     #     are included now that anions/cations are populated.
     #     CutoffsManager reads iman.inters_requested, so this must all happen
@@ -75,14 +77,19 @@ def workflow(args):
     # =========================================================================
     cphmd = None
     if getattr(args, 'lambda_ref', None) and getattr(args, 'lambda_dir', None):
-        from intermap.managers.cphmd import CpHMDManager
+        from intermap.managers.cphmd import (CpHMDManager,
+                                             DEFAULT_LAMBDA_GLOB, HSPT_STATES)
+        trajectory = iman.universe.trajectory
         cphmd = CpHMDManager(
             lambda_ref_path = args.lambda_ref,
             lambda_dir      = args.lambda_dir,
             lambda_glob     = getattr(args, 'lambda_glob',
-                                      '**/eq/*-coord-*.xvg'),
+                                      DEFAULT_LAMBDA_GLOB),
             traj_frames     = iman.traj_frames,
-            ps_per_frame    = getattr(args, 'lambda_ps_per_frame', 50),
+            ps_per_frame    = getattr(args, 'lambda_ps_per_frame', None),
+            traj_t0         = trajectory[0].time,
+            traj_dt         = trajectory.dt,
+            hspt_states     = getattr(args, 'hspt_states', HSPT_STATES),
         )
         cphmd.patch_index_manager(iman)
         # Re-evaluate which interactions are possible now that

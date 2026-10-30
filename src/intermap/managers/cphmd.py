@@ -6,7 +6,9 @@ Design constraints
 ------------------
 - others() and aro() are @njit kernels receiving static index arrays.
   Per-frame state cannot be passed without recompilation overhead.
-- Gating happens AFTER runpar() on (ijf_chunk, inters_chunk) using
+- Titratable atoms are therefore given every role they can take in any
+  protonation state (upper bound), and roles that are not valid at a given
+  frame are removed AFTER runpar() on (ijf_chunk, inters_chunk) using
   vectorised numpy -- no Python loops over pairs.
 
 Column layout of inters_chunk (mirrors ContainerManager.get_inter_names):
@@ -14,24 +16,25 @@ Column layout of inters_chunk (mirrors ContainerManager.get_inter_names):
   where 'None' sentinels are EXCLUDED from both selected_aro and
   selected_others before indexing.
 
-Lambda convention (GROMACS CpHMD, this force field):
-  ASPT / GLUT:
+Lambda convention (GROMACS CpHMD, Aho et al. JCTC 2022):
+  Single-site residues (ASPT, GLUT, LYST, ARGT):
     lambda < 0.5  -> protonated
     lambda >= 0.5 -> deprotonated
 
-  HSPT state 1:
-    lambda >= 0.5 -> protonated
-    lambda < 0.5  -> deprotonated
-
-  HSPT state 2/3:
-    tautomer coordinates only, never ionic
+  HSPT (multisite, lambda_1 + lambda_2 + lambda_3 = 1):
+    the state with the largest lambda is the current tautomer.
+    Default order (HSP, HSE, HSD) follows the state charges of the CHARMM36
+    CpHMD parameters: state 2 keeps HE2 (HSE), state 3 keeps HD1 (HSD).
 
 Trajectory / lambda alignment:
-  frame f  <->  lambda window [f*50 : (f+1)*50] ps, mean of window used.
+  trajectory frame f is at time t0 + f * ps_per_frame, and the lambda value
+  sampled closest to that time (from the .xvg time column) is used.
 
-CpHMD-specific sidechain chemistry gating:
-  - acidic titratable hydrogens are treated as lambda-controlled visibility
-  - charged HSPT ND1/NE2 cannot act as acceptors while protonated
+Roles controlled by lambda:
+  - titratable protons exist only in protonated states (all interactions)
+  - ionic atoms are charged only in their charged state
+  - LYST NZ and HSPT ND1/NE2 accept H-bonds / coordinate metals only when
+    they carry no proton
 """
 
 import logging
@@ -43,28 +46,46 @@ import pandas as pd
 
 logger = logging.getLogger('InterMapLogger')
 
-PS_PER_FRAME = 50
 CHARGE_CUTOFF = 0.5
-HSPT_CATION_STATE = 1
+DEFAULT_LAMBDA_GLOB = '**/*-coord-*.xvg'
 
-ACIDIC_RESNAMES = frozenset({'ASPT', 'GLUT'})
+# Single-site residues: atom roles that depend on the protonation state.
+# Proton names are the hydrogens whose charge is 0 in the deprotonated state.
+SINGLE_SITE = {
+    'ASPT': {'anion': ['OD1', 'OD2'], 'proton': ['HD2']},
+    'GLUT': {'anion': ['OE1', 'OE2'], 'proton': ['HE2']},
+    'LYST': {'cation': ['NZ'], 'proton': ['HZ3'], 'acceptor': ['NZ']},
+    'ARGT': {'cation': ['NE', 'NH1', 'NH2'], 'proton': ['HH12']},
+}
+
 HISTIDINE_RESNAME = 'HSPT'
-SUPPORTED_RESNAMES = ACIDIC_RESNAMES | {HISTIDINE_RESNAME}
+HSPT_STATES = ('HSP', 'HSE', 'HSD')
+HSPT_ROLES = {
+    'HSP': {'cation': ['ND1', 'NE2'], 'proton': ['HD1', 'HE2']},
+    'HSD': {'acceptor': ['NE2'], 'proton': ['HD1']},
+    'HSE': {'acceptor': ['ND1'], 'proton': ['HE2']},
+}
 
-ANION_ATOMS = {'ASPT': ['OD1', 'OD2'], 'GLUT': ['OE1', 'OE2']}
-CATION_ATOMS = {'HSPT': ['ND1', 'NE2']}
+SUPPORTED_RESNAMES = frozenset(SINGLE_SITE) | {HISTIDINE_RESNAME}
+ROLES = ('anion', 'cation', 'acceptor', 'proton')
 
-IONIC_INTERACTION_NAMES = frozenset({
-    'Anionic', 'Cationic', 'AnionPi', 'PiAnion', 'PiCation', 'CationPi'
-})
-ACCEPTOR_ROW1_INTERACTION_NAMES = frozenset({
-    'HBAcceptor', 'XBAcceptor', 'MetalAcceptor'
-})
-ACCEPTOR_ROW2_INTERACTION_NAMES = frozenset({
-    'HBDonor', 'XBDonor', 'MetalDonor'
-})
-DONOR_H_ROW1_INTERACTION_NAMES = frozenset({'HBDonor'})
-DONOR_H_ROW2_INTERACTION_NAMES = frozenset({'HBAcceptor'})
+# Interactions affected by each role, when the titratable atom is in the
+# first (row 1) or second (row 2) column of ijf. 'proton' affects all.
+ROLE_INTERACTIONS = {
+    'anion': ({'Anionic', 'AnionPi'}, {'Cationic', 'PiAnion'}),
+    'cation': ({'Cationic', 'CationPi'}, {'Anionic', 'PiCation'}),
+    'acceptor': ({'HBAcceptor', 'XBAcceptor', 'MetalAcceptor'},
+                 {'HBDonor', 'XBDonor', 'MetalDonor'}),
+}
+
+
+def register_protein_resnames():
+    """
+    Make MDAnalysis' 'protein' and 'backbone' selection keywords include the
+    titratable residue names, which are otherwise silently left out.
+    """
+    from MDAnalysis.core.selection import ProteinSelection
+    ProteinSelection.prot_res.update(SUPPORTED_RESNAMES)
 
 
 # -- lambda file utilities ---------------------------------------------------
@@ -72,39 +93,38 @@ DONOR_H_ROW2_INTERACTION_NAMES = frozenset({'HBAcceptor'})
 def parse_lambda_xvg(filepath):
     """
     Parse a GROMACS CpHMD .xvg file.
-    Returns lam : np.ndarray float32 (n_ps,)
+    Returns time : np.ndarray float64 (n,) in ps, lam : np.ndarray float32 (n,)
     """
-    data_lines = []
-    with open(filepath) as f:
-        for line in f:
-            s = line.strip()
-            if s and not s.startswith(('#', '@')):
-                data_lines.append(s)
-    if not data_lines:
+    data = np.loadtxt(filepath, comments=('#', '@'), ndmin=2)
+    if data.shape[0] == 0:
         raise ValueError(f"No data in {filepath}")
-    data = np.loadtxt(data_lines)
-    if data.ndim == 1:
-        data = data[np.newaxis, :]
-    return data[:, 1].astype(np.float32)
+    return data[:, 0], data[:, 1].astype(np.float32)
 
 
-def build_frame_lambda(lam_ps, n_traj_frames, ps_per_frame=PS_PER_FRAME):
+def lambda_at_times(time, lam, frame_times, label=''):
     """
-    Average per-ps lambda into per-trajectory-frame lambda via reshape+mean.
-    No Python loop over frames.
+    Lambda value sampled closest to each trajectory frame time.
 
-    Returns frame_lam : np.ndarray float32 (n_traj_frames,)
+    Raises if the frames are not covered by the lambda time series.
+
+    Returns frame_lam : np.ndarray float32 (n_frames,)
     """
-    needed = n_traj_frames * ps_per_frame
-    n_lam = len(lam_ps)
-    if n_lam < needed:
-        logger.warning(
-            f"Lambda array ({n_lam} ps) shorter than needed ({needed} ps). "
-            f"Padding with last value.")
-        pad = np.full(needed - n_lam, lam_ps[-1], dtype=np.float32)
-        lam_ps = np.concatenate([lam_ps, pad])
-    windows = lam_ps[:needed].reshape(n_traj_frames, ps_per_frame)
-    return windows.mean(axis=1).astype(np.float32)
+    step = np.median(np.diff(time)) if time.size > 1 else 0.0
+    if frame_times.size and (frame_times.min() < time[0] - step or
+                             frame_times.max() > time[-1] + step):
+        raise ValueError(
+            f"CpHMD: lambda data {label} covers {time[0]}-{time[-1]} ps but "
+            f"the analyzed frames span {frame_times.min()}-"
+            f"{frame_times.max()} ps. Check lambda_ps_per_frame and that the "
+            f"lambda files belong to the analyzed trajectory.")
+
+    if time.size == 1:
+        return np.full(frame_times.size, lam[0], dtype=np.float32)
+
+    right = np.clip(np.searchsorted(time, frame_times), 1, time.size - 1)
+    left = right - 1
+    use_left = (frame_times - time[left]) <= (time[right] - frame_times)
+    return lam[np.where(use_left, left, right)]
 
 
 # -- reference file parser ---------------------------------------------------
@@ -112,8 +132,8 @@ def build_frame_lambda(lam_ps, n_traj_frames, ps_per_frame=PS_PER_FRAME):
 def read_lambda_ref(path):
     """
     Parse the lambda reference file.
-    Columns: resname  state  resid  coord_file  (one header line)
-    Returns pd.DataFrame with coord_num added.
+    Columns: resname  state  resid  [chain]  coord_file  (one header line)
+    Returns pd.DataFrame with coord_num added (chain is None if absent).
     """
     rows = []
     with open(path) as f:
@@ -122,18 +142,19 @@ def read_lambda_ref(path):
         parts = line.strip().split()
         if not parts:
             continue
-        resname = parts[0]
-        state = int(parts[1])
-        resid = int(parts[2])
-        coord_file = parts[3]
+        if len(parts) not in (4, 5):
+            raise ValueError(
+                f"Invalid line in lambda reference {path}: {line!r}. Expected"
+                f" 'resname state resid [chain] coord_file'.")
+        coord_file = parts[-1]
         m = re.search(r'-coord-(\d+)\.xvg', coord_file)
-        coord_num = int(m.group(1)) if m else -1
         rows.append(dict(
-            resname=resname,
-            state=state,
-            resid=resid,
+            resname=parts[0],
+            state=int(parts[1]),
+            resid=int(parts[2]),
+            chain=parts[3] if len(parts) == 5 else None,
             coord_file=coord_file,
-            coord_num=coord_num,
+            coord_num=int(m.group(1)) if m else -1,
         ))
     return pd.DataFrame(rows)
 
@@ -152,10 +173,12 @@ class CpHMDManager:
         cphmd = CpHMDManager(
             lambda_ref_path = args.lambda_ref,
             lambda_dir      = args.lambda_dir,
-            lambda_glob     = getattr(args, 'lambda_glob',
-                                      '**/eq/*-coord-*.xvg'),
+            lambda_glob     = args.lambda_glob,
             traj_frames     = iman.traj_frames,
-            ps_per_frame    = getattr(args, 'lambda_ps_per_frame', 50),
+            ps_per_frame    = args.lambda_ps_per_frame,
+            traj_t0         = universe.trajectory[0].time,
+            traj_dt         = universe.trajectory.dt,
+            hspt_states     = args.hspt_states,
         )
         cphmd.patch_index_manager(iman)
 
@@ -174,150 +197,171 @@ class CpHMDManager:
     """
 
     def __init__(self, lambda_ref_path, lambda_dir, lambda_glob,
-                 traj_frames, ps_per_frame=PS_PER_FRAME):
-        self.traj_frames = traj_frames
+                 traj_frames, ps_per_frame=None, traj_t0=0.0, traj_dt=None,
+                 hspt_states=HSPT_STATES):
+        self.traj_frames = np.asarray(traj_frames)
         self.n_frames = len(traj_frames)
-        self.ps_per_frame = ps_per_frame
+        self.hspt_states = tuple(hspt_states)
+        if sorted(self.hspt_states) != sorted(HSPT_ROLES):
+            raise ValueError(
+                f"CpHMD: hspt_states must order {sorted(HSPT_ROLES)}, got "
+                f"{self.hspt_states}")
+        self.ps_per_frame = self._get_ps_per_frame(ps_per_frame, traj_dt)
+        self.frame_times = traj_t0 + self.traj_frames * self.ps_per_frame
 
         self.ref = read_lambda_ref(lambda_ref_path)
         self._xvg = self._find_xvg(lambda_dir, lambda_glob)
-        self.site_entries = self._load_all()
-        self.sites_by_resid = self._group_sites_by_resid()
-        self.per_residue = self.sites_by_resid
+        self.sites = self._load_all()
+        self.atom_roles = None
         self._log_summary()
 
     # -- internal ------------------------------------------------------------
 
     @staticmethod
-    def _find_xvg(direc, glob_pattern):
-        result = {}
-        for p in pathlib.Path(direc).glob(glob_pattern):
-            m = re.search(r'-coord-(\d+)\.xvg', str(p))
-            if not m:
-                continue
-            coord_num = int(m.group(1))
-            prev = result.get(coord_num)
-            if prev is not None and prev != p:
-                logger.warning(
-                    f"CpHMD: duplicate .xvg matches for coord_num={coord_num}: "
-                    f"{prev} and {p}. Using {p}.")
-            result[coord_num] = p
-        return result
+    def _get_ps_per_frame(ps_per_frame, traj_dt):
+        if ps_per_frame is None:
+            if not traj_dt:
+                raise ValueError(
+                    "CpHMD: the trajectory has no time step. Set "
+                    "lambda_ps_per_frame in the [cphmd] section.")
+            return float(traj_dt)
 
-    def _group_sites_by_resid(self):
-        grouped = {}
-        for entry in self.site_entries:
-            grouped.setdefault(entry['resid'], []).append(entry)
-        return grouped
+        if traj_dt and not np.isclose(ps_per_frame, traj_dt, rtol=1e-3):
+            logger.warning(
+                f"CpHMD: lambda_ps_per_frame={ps_per_frame} differs from the "
+                f"trajectory time step ({traj_dt} ps). Using "
+                f"lambda_ps_per_frame.")
+        return float(ps_per_frame)
 
     @staticmethod
-    def _get_protonation_masks(resname, state, frame_lam):
-        if resname == HISTIDINE_RESNAME and state == HSPT_CATION_STATE:
-            is_protonated = frame_lam >= CHARGE_CUTOFF
-        else:
-            is_protonated = frame_lam < CHARGE_CUTOFF
-        is_deprot = ~is_protonated
-        return is_protonated, is_deprot
+    def _find_xvg(direc, glob_pattern):
+        result = {}
+        for p in sorted(pathlib.Path(direc).glob(glob_pattern)):
+            m = re.search(r'-coord-(\d+)\.xvg', str(p))
+            if m:
+                result.setdefault(int(m.group(1)), []).append(p)
+        return result
+
+    def _get_xvg(self, coord_num):
+        paths = self._xvg.get(coord_num, [])
+        if len(paths) > 1:
+            raise ValueError(
+                f"CpHMD: several .xvg files match coord_num={coord_num}: "
+                f"{[str(x) for x in paths]}. Narrow lambda_dir or "
+                f"lambda_glob so each coordinate file is found once.")
+        return paths[0] if paths else None
+
+    @staticmethod
+    def _get_protonation_masks(frame_lam):
+        is_protonated = frame_lam < CHARGE_CUTOFF
+        return is_protonated, ~is_protonated
+
+    def _get_hspt_tautomers(self, frame_lams):
+        """Tautomer index (into self.hspt_states) with the largest lambda."""
+        return np.argmax(np.vstack(frame_lams), axis=0)
 
     def _load_all(self):
-        site_entries = []
-        for _, row in self.ref.iterrows():
-            resname = row['resname']
-            resid = int(row['resid'])
-            state = int(row['state'])
-            coord_num = int(row['coord_num'])
+        """
+        One entry per titratable residue with its per-frame role masks:
+        {'resname', 'resid', 'chain', 'roles': {role: {atom_name: mask}}}
+        """
+        skipped = sorted(set(self.ref['resname']) - SUPPORTED_RESNAMES)
+        if skipped:
+            logger.info(f"CpHMD: ignoring unsupported residues {skipped}")
 
-            if resname not in SUPPORTED_RESNAMES:
-                continue
+        sites = []
+        keys = ['resname', 'chain', 'resid']
+        ref = self.ref[self.ref['resname'].isin(SUPPORTED_RESNAMES)]
+        for (resname, chain, resid), rows in ref.groupby(keys, dropna=False,
+                                                         sort=False):
+            chain = None if pd.isna(chain) else chain
+            label = f"{resname}{resid}" + (f":{chain}" if chain else '')
+            rows = rows.sort_values('state')
+            n_states = len(self.hspt_states) if (
+                    resname == HISTIDINE_RESNAME) else 1
+            if rows['state'].tolist() != list(range(1, n_states + 1)):
+                raise ValueError(
+                    f"CpHMD: {label} must have lambda states "
+                    f"1..{n_states} in the reference, got "
+                    f"{rows['state'].tolist()}.")
 
-            xvg = self._xvg.get(coord_num)
-            if xvg is None:
+            frame_lams = []
+            for _, row in rows.iterrows():
+                xvg = self._get_xvg(int(row['coord_num']))
+                if xvg is None:
+                    break
+                time, lam = parse_lambda_xvg(xvg)
+                frame_lams.append(
+                    lambda_at_times(time, lam, self.frame_times, label))
+            if len(frame_lams) != n_states:
                 logger.warning(
-                    f"CpHMD: no .xvg for coord_num={coord_num} "
-                    f"({resname}{resid} state={state}). Skipping.")
+                    f"CpHMD: missing .xvg for {label} "
+                    f"(coord files {rows['coord_file'].tolist()}). Skipping.")
                 continue
 
-            lam_ps = parse_lambda_xvg(xvg)
-            frame_lam = build_frame_lambda(lam_ps, self.n_frames,
-                                           self.ps_per_frame)
-            is_protonated, is_deprot = self._get_protonation_masks(
-                resname, state, frame_lam)
+            sites.append(dict(resname=resname, resid=int(resid), chain=chain,
+                              label=label, frame_lams=frame_lams,
+                              roles=self._get_roles(resname, frame_lams)))
+        return sites
 
-            if resname in ACIDIC_RESNAMES:
-                is_charged = is_deprot
-                ionic_as = 'anion'
-            elif resname == HISTIDINE_RESNAME:
-                if state == HSPT_CATION_STATE:
-                    is_charged = is_protonated
-                    ionic_as = 'cation'
-                else:
-                    is_charged = np.zeros(self.n_frames, dtype=bool)
-                    ionic_as = 'neutral'
-            else:
-                continue
+    def _get_roles(self, resname, frame_lams):
+        """Per-frame activity of each (role, atom name) of a residue."""
+        roles = {role: {} for role in ROLES}
 
-            site_entries.append(dict(
-                resid=resid,
-                resname=resname,
-                state=state,
-                coord_num=coord_num,
-                frame_lam=frame_lam,
-                is_protonated=is_protonated,
-                is_charged=is_charged,
-                ionic_as=ionic_as,
-            ))
-        return site_entries
+        if resname == HISTIDINE_RESNAME:
+            tautomer = self._get_hspt_tautomers(frame_lams)
+            for i, state in enumerate(self.hspt_states):
+                for role, names in HSPT_ROLES[state].items():
+                    for name in names:
+                        mask = roles[role].setdefault(
+                            name, np.zeros(self.n_frames, dtype=bool))
+                        mask |= tautomer == i
+            return roles
+
+        is_protonated, is_deprot = self._get_protonation_masks(frame_lams[0])
+        active_when = {'anion': is_deprot, 'cation': is_protonated,
+                       'acceptor': is_deprot, 'proton': is_protonated}
+        for role, names in SINGLE_SITE[resname].items():
+            for name in names:
+                roles[role][name] = active_when[role]
+        return roles
 
     def _log_summary(self):
         logger.info("CpHMD per-frame protonation summary:")
-        for info in sorted(self.site_entries,
-                           key=lambda x: (x['resid'], x['state'])):
-            pct = 100.0 * info['is_charged'].mean()
-            logger.info(
-                f"  {info['resname']}{info['resid']} state={info['state']} "
-                f"ionic_as={info['ionic_as']}  "
-                f"charged={pct:.1f}% of frames  "
-                f"mean_lam={info['frame_lam'].mean():.3f}")
+        for site in sorted(self.sites, key=lambda x: (str(x['chain']),
+                                                       x['resid'])):
+            if site['resname'] == HISTIDINE_RESNAME:
+                tautomer = self._get_hspt_tautomers(site['frame_lams'])
+                pops = ', '.join(
+                    f"{state}={100.0 * np.mean(tautomer == i):.1f}%"
+                    for i, state in enumerate(self.hspt_states))
+                logger.info(f"  {site['label']}  {pops} of frames")
+            else:
+                is_protonated, _ = self._get_protonation_masks(
+                    site['frame_lams'][0])
+                logger.info(
+                    f"  {site['label']}  protonated="
+                    f"{100.0 * is_protonated.mean():.1f}% of frames  "
+                    f"mean_lam={site['frame_lams'][0].mean():.3f}")
 
     @staticmethod
-    def _or_masks(entries, field, n_frames):
-        mask = np.zeros(n_frames, dtype=bool)
-        for entry in entries:
-            mask |= entry[field]
-        return mask
+    def _select_residue(universe, site):
+        """Atoms of a titratable residue; raises if it isn't unique."""
+        query = f"resname {site['resname']} and resid {site['resid']}"
+        if site['chain'] is not None:
+            chain = site['chain']
+            if hasattr(universe.atoms, 'chainIDs'):
+                query += f" and (segid {chain} or chainID {chain})"
+            else:
+                query += f" and segid {chain}"
 
-    @staticmethod
-    def _get_col_indices(selected_aro, selected_others, interaction_names):
-        aro_names = [x for x in selected_aro if x != 'None']
-        other_names = [x for x in selected_others if x != 'None']
-
-        cols = []
-        n_aro = len(aro_names)
-
-        for i, name in enumerate(aro_names):
-            if name in interaction_names:
-                cols.append(i)
-
-        for i, name in enumerate(other_names):
-            if name in interaction_names:
-                cols.append(n_aro + i)
-
-        all_names = [*aro_names, *other_names]
-        matched = [all_names[c] for c in cols]
-        return np.array(cols, dtype=np.int32), matched
-
-    @staticmethod
-    def _bonded_hydrogens(atom_group):
-        hydrogens = []
-        for atom in atom_group:
-            for bonded in atom.bonded_atoms:
-                name = getattr(bonded, 'name', '')
-                element = getattr(bonded, 'element', '')
-                if element == 'H' or name.startswith('H'):
-                    hydrogens.append(bonded.index)
-        if not hydrogens:
-            return np.array([], dtype=np.int32)
-        return np.unique(np.asarray(hydrogens, dtype=np.int32))
+        atoms = universe.select_atoms(query)
+        if len(atoms.residues) > 1:
+            raise ValueError(
+                f"CpHMD: '{query}' matches {len(atoms.residues)} residues "
+                f"(segments {sorted(set(atoms.residues.segids))}). Add the "
+                f"chain column to the lambda reference file.")
+        return atoms
 
     @staticmethod
     def _to_sel_space(sel_idx, global_idx):
@@ -330,47 +374,56 @@ class CpHMDManager:
                           missing=-1)
         return raw[raw != -1].astype(np.int32)
 
+    @staticmethod
+    def _add(array, extra):
+        if len(extra) == 0:
+            return array
+        return np.unique(np.concatenate([array, extra])).astype(np.int32)
+
     # -- public: static patch ------------------------------------------------
 
     def patch_index_manager(self, iman):
         """
-        Add titratable atoms to iman.anions/cations as an upper-bound patch
-        so estimate() and ContainerManager pre-allocate enough space.
-        Per-frame gating happens in gate_chunk().
+        Give titratable atoms every role they can take in any state, as an
+        upper bound so estimate() and ContainerManager pre-allocate enough
+        space. Per-frame gating happens in gate_chunk().
         """
         universe = iman.universe
         sel_idx = iman.sel_idx
-        anion_add, cation_add = [], []
 
-        for resid, entries in self.sites_by_resid.items():
-            ionic_entries = [x for x in entries if x['ionic_as'] != 'neutral']
-            if not ionic_entries:
+        self.atom_roles = []
+        found = set()
+        for site in self.sites:
+            res_atoms = self._select_residue(universe, site)
+            if not len(res_atoms):
+                logger.warning(
+                    f"CpHMD: {site['label']} not found in the topology. "
+                    f"Skipping.")
                 continue
+            found.add(res_atoms.residues[0].resindex)
 
-            ionic_as = ionic_entries[0]['ionic_as']
-            resname = ionic_entries[0]['resname']
-            res_sel = universe.select_atoms(
-                f"resname {resname} and resid {resid}")
-            if not len(res_sel):
-                continue
+            for role, by_name in site['roles'].items():
+                for name, active in by_name.items():
+                    atom = res_atoms.select_atoms(f"name {name}")
+                    if not len(atom):
+                        logger.warning(
+                            f"CpHMD: atom {name} not found in "
+                            f"{site['label']}. Its {role} role is not gated.")
+                        continue
+                    sel_atom = self._to_sel_space(sel_idx, atom.indices)
+                    if len(sel_atom):
+                        self.atom_roles.append(dict(
+                            role=role, sel_atom=int(sel_atom[0]),
+                            active=active, label=f"{site['label']}:{name}"))
 
-            atm_names = (ANION_ATOMS if ionic_as == 'anion'
-                         else CATION_ATOMS).get(resname, [])
-            charged = res_sel.select_atoms(
-                'name ' + ' '.join(atm_names)).indices
-            if ionic_as == 'anion':
-                anion_add.extend(charged)
-            else:
-                cation_add.extend(charged)
-
-        add_a = self._to_sel_space(sel_idx, anion_add)
-        add_c = self._to_sel_space(sel_idx, cation_add)
-        if len(add_a):
-            iman.anions = np.unique(
-                np.concatenate([iman.anions, add_a])).astype(np.int32)
-        if len(add_c):
-            iman.cations = np.unique(
-                np.concatenate([iman.cations, add_c])).astype(np.int32)
+        added = {role: np.array(
+            [x['sel_atom'] for x in self.atom_roles if x['role'] == role],
+            dtype=np.int32) for role in ROLES}
+        iman.anions = self._add(iman.anions, added['anion'])
+        iman.cations = self._add(iman.cations, added['cation'])
+        iman.hb_acc = self._add(iman.hb_acc, added['acceptor'])
+        iman.met_acc = self._add(iman.met_acc, added['acceptor'])
+        iman.xb_acc = self._add(iman.xb_acc, added['acceptor'])
 
         (iman.rings,
          iman.s1_cat, iman.s2_cat, iman.s1_ani, iman.s2_ani,
@@ -381,125 +434,92 @@ class CpHMDManager:
          iman.s1_aro_idx, iman.s2_aro_idx,
          iman.xyz_aro_idx) = iman.get_aro()
 
+        # Titratable residues present in the topology but without lambdas
+        titratable = universe.select_atoms(
+            'resname ' + ' '.join(sorted(SUPPORTED_RESNAMES))).residues
+        ungated = [f"{r.resname}{r.resid}" for r in titratable
+                   if r.resindex not in found]
+        if ungated:
+            logger.warning(
+                f"CpHMD: no lambda data for {ungated}. They keep the "
+                f"protonation state of the topology.")
+
         logger.info(
             f"CpHMD static patch: anions={len(iman.anions)}, "
-            f"cations={len(iman.cations)}")
+            f"cations={len(iman.cations)}, "
+            f"hb_acceptors={len(iman.hb_acc)}, "
+            f"gated atom roles={len(self.atom_roles)}")
 
     # -- public: interaction columns ----------------------------------------
 
     @staticmethod
-    def get_ionic_col_indices(selected_aro, selected_others):
-        ionic_cols, matched = CpHMDManager._get_col_indices(
-            selected_aro, selected_others, IONIC_INTERACTION_NAMES)
-        logger.info(
-            f"CpHMD ionic column indices in inters_chunk: "
-            f"{ionic_cols.tolist()} -> {matched}")
-        return ionic_cols
+    def _get_col_indices(selected_aro, selected_others, interaction_names):
+        aro_names = [x for x in selected_aro if x != 'None']
+        other_names = [x for x in selected_others if x != 'None']
+        all_names = [*aro_names, *other_names]
+
+        cols = [i for i, name in enumerate(all_names)
+                if interaction_names is None or name in interaction_names]
+        matched = [all_names[c] for c in cols]
+        return np.array(cols, dtype=np.int32), matched
 
     @staticmethod
     def get_gating_col_indices(selected_aro, selected_others):
-        col_specs = {
-            'ionic': IONIC_INTERACTION_NAMES,
-            'acceptor_row1': ACCEPTOR_ROW1_INTERACTION_NAMES,
-            'acceptor_row2': ACCEPTOR_ROW2_INTERACTION_NAMES,
-            'donor_h_row1': DONOR_H_ROW1_INTERACTION_NAMES,
-            'donor_h_row2': DONOR_H_ROW2_INTERACTION_NAMES,
-        }
+        """
+        Columns to suppress per role, for the titratable atom in row 1 and
+        in row 2 of ijf. A missing proton suppresses all the columns.
+        """
+        col_specs = dict(ROLE_INTERACTIONS, proton=(None, None))
 
         gating_cols = {}
-        for key, names in col_specs.items():
-            cols, matched = CpHMDManager._get_col_indices(
-                selected_aro, selected_others, names)
-            gating_cols[key] = cols
+        for role, (names_row1, names_row2) in col_specs.items():
+            cols_row1, matched1 = CpHMDManager._get_col_indices(
+                selected_aro, selected_others, names_row1)
+            cols_row2, matched2 = CpHMDManager._get_col_indices(
+                selected_aro, selected_others, names_row2)
+            gating_cols[role] = (cols_row1, cols_row2)
             logger.info(
-                f"CpHMD gating columns [{key}]: "
-                f"{cols.tolist()} -> {matched}")
+                f"CpHMD gating columns [{role}]: row1 {matched1}, "
+                f"row2 {matched2}")
         return gating_cols
 
     # -- public: atom lookup -------------------------------------------------
 
     def build_atom_lookup(self, iman):
         """
-        Build sel_idx-space atom index arrays for CpHMD-aware gating.
+        Build sel_idx-space lookup tables for CpHMD-aware gating.
         Call once after patch_index_manager(), before the trajectory loop.
 
         Returns
         -------
-        dict with three lists:
-            'ionic'    : atoms whose ionic interactions are lambda-gated
-            'donor_h'  : titratable hydrogens whose H-bond donor role is gated
-            'acceptor' : titratable atoms whose acceptor role is gated
+        dict role -> (atom_row, active)
+            atom_row : np.ndarray int (n_sel,), row of each atom in `active`
+                       or -1 if the atom has no gated role
+            active   : np.ndarray bool (n_atoms_role, n_frames), whether the
+                       atom can take the role at each analyzed frame
         """
-        universe = iman.universe
-        sel_idx = iman.sel_idx
-        lookup = {'ionic': [], 'donor_h': [], 'acceptor': []}
-
-        for resid, entries in self.sites_by_resid.items():
-            resname = entries[0]['resname']
-            res_sel = universe.select_atoms(
-                f"resname {resname} and resid {resid}")
-            if not len(res_sel):
+        n_sel = len(iman.sel_idx)
+        lookup = {}
+        for role in ROLES:
+            entries = [x for x in self.atom_roles if x['role'] == role]
+            if not entries:
                 continue
-
-            ionic_entries = [x for x in entries if x['ionic_as'] != 'neutral']
-            if ionic_entries:
-                ionic_as = ionic_entries[0]['ionic_as']
-                atom_names = (ANION_ATOMS if ionic_as == 'anion'
-                              else CATION_ATOMS).get(resname, [])
-                global_idx = res_sel.select_atoms(
-                    'name ' + ' '.join(atom_names)).indices
-                sel_space = self._to_sel_space(sel_idx, global_idx)
-                if len(sel_space):
-                    lookup['ionic'].append(dict(
-                        resid=resid,
-                        resname=resname,
-                        sel_atoms=sel_space,
-                        is_charged=self._or_masks(
-                            ionic_entries, 'is_charged', self.n_frames),
-                    ))
-
-            if resname in ACIDIC_RESNAMES:
-                titratable_atoms = res_sel.select_atoms(
-                    'name ' + ' '.join(ANION_ATOMS[resname]))
-                donor_h_global = self._bonded_hydrogens(titratable_atoms)
-                donor_h_sel = self._to_sel_space(sel_idx, donor_h_global)
-                if len(donor_h_sel):
-                    lookup['donor_h'].append(dict(
-                        resid=resid,
-                        resname=resname,
-                        sel_atoms=donor_h_sel,
-                        is_visible=self._or_masks(
-                            entries, 'is_protonated', self.n_frames),
-                    ))
-
-            if resname == HISTIDINE_RESNAME:
-                cation_entries = [
-                    x for x in entries if x['state'] == HSPT_CATION_STATE
-                ]
-                if cation_entries:
-                    acceptor_atoms = res_sel.select_atoms(
-                        'name ' + ' '.join(CATION_ATOMS[resname])).indices
-                    acceptor_sel = self._to_sel_space(sel_idx, acceptor_atoms)
-                    if len(acceptor_sel):
-                        is_cationic = self._or_masks(
-                            cation_entries, 'is_protonated', self.n_frames)
-                        lookup['acceptor'].append(dict(
-                            resid=resid,
-                            resname=resname,
-                            sel_atoms=acceptor_sel,
-                            is_allowed=~is_cationic,
-                        ))
+            atom_row = np.full(n_sel, -1, dtype=np.int64)
+            atom_row[[x['sel_atom'] for x in entries]] = np.arange(
+                len(entries))
+            active = np.vstack([x['active'] for x in entries])
+            lookup[role] = (atom_row, active)
 
         logger.info(
-            f"CpHMD atom lookup: ionic={len(lookup['ionic'])}, "
-            f"donor_h={len(lookup['donor_h'])}, "
-            f"acceptor={len(lookup['acceptor'])}")
+            "CpHMD atom lookup: " + ', '.join(
+                f"{role}={lookup[role][1].shape[0]}" for role in lookup))
         return lookup
 
     # -- public: per-chunk gating -------------------------------------------
 
-    def gate_chunk(self, ijf_chunk, inters_chunk,
-                   chunk_contiguous_indices, gating_cols, atom_lookup):
+    @staticmethod
+    def gate_chunk(ijf_chunk, inters_chunk, chunk_contiguous_indices,
+                   gating_cols, atom_lookup):
         """
         Zero out interaction columns for pairs where the titratable residue was
         not allowed to express that role at that frame.
@@ -511,8 +531,8 @@ class CpHMDManager:
                                   atom indices are in sel_idx space.
         inters_chunk            : np.ndarray bool (n_pairs, n_inter_types)
         chunk_contiguous_indices: np.ndarray int (chunk_size,)
-                                  local_frame_idx -> contiguous global idx
-        gating_cols             : dict of np.ndarray int32 column indices
+                                  local_frame_idx -> index in traj_frames
+        gating_cols             : dict from get_gating_col_indices()
         atom_lookup             : dict from build_atom_lookup()
 
         Returns
@@ -520,76 +540,20 @@ class CpHMDManager:
         ijf_chunk, inters_chunk : with invalid CpHMD-dependent roles suppressed
                                   and all-False rows dropped.
         """
-        if ijf_chunk.shape[0] == 0:
+        if ijf_chunk.shape[0] == 0 or not atom_lookup:
             return ijf_chunk, inters_chunk
 
-        if atom_lookup is None:
-            return ijf_chunk, inters_chunk
-
-        has_lookup = any(len(atom_lookup[key]) > 0 for key in atom_lookup)
-        has_cols = any(len(gating_cols[key]) > 0 for key in gating_cols)
-        if not has_lookup or not has_cols:
-            return ijf_chunk, inters_chunk
-
-        local_frames = ijf_chunk[:, 2]
-        local_clipped = np.clip(local_frames, 0,
-                                len(chunk_contiguous_indices) - 1)
-        global_frame_idx = chunk_contiguous_indices[local_clipped]
-
-        pair_col0 = ijf_chunk[:, 0]
-        pair_col1 = ijf_chunk[:, 1]
-
-        ionic_cols = gating_cols['ionic']
-        for entry in atom_lookup['ionic']:
-            if len(ionic_cols) == 0:
-                break
-            sel_atoms = entry['sel_atoms']
-            pair_involves = (
-                np.isin(pair_col0, sel_atoms) |
-                np.isin(pair_col1, sel_atoms)
-            )
-            if not pair_involves.any():
-                continue
-            charged_at_frame = entry['is_charged'][global_frame_idx]
-            suppress = pair_involves & ~charged_at_frame
-            if suppress.any():
-                inters_chunk[np.ix_(suppress, ionic_cols)] = False
-
-        donor_h_row1 = gating_cols['donor_h_row1']
-        donor_h_row2 = gating_cols['donor_h_row2']
-        for entry in atom_lookup['donor_h']:
-            sel_atoms = entry['sel_atoms']
-            visible_at_frame = entry['is_visible'][global_frame_idx]
-
-            if len(donor_h_row1):
-                donor_row1 = np.isin(pair_col0, sel_atoms)
-                suppress = donor_row1 & ~visible_at_frame
+        frames = chunk_contiguous_indices[ijf_chunk[:, 2]]
+        for role, (atom_row, active) in atom_lookup.items():
+            for side, cols in enumerate(gating_cols[role]):
+                if len(cols) == 0:
+                    continue
+                rows = atom_row[ijf_chunk[:, side]]
+                gated = rows >= 0
+                suppress = np.zeros(ijf_chunk.shape[0], dtype=bool)
+                suppress[gated] = ~active[rows[gated], frames[gated]]
                 if suppress.any():
-                    inters_chunk[np.ix_(suppress, donor_h_row1)] = False
-
-            if len(donor_h_row2):
-                donor_row2 = np.isin(pair_col1, sel_atoms)
-                suppress = donor_row2 & ~visible_at_frame
-                if suppress.any():
-                    inters_chunk[np.ix_(suppress, donor_h_row2)] = False
-
-        acceptor_row1 = gating_cols['acceptor_row1']
-        acceptor_row2 = gating_cols['acceptor_row2']
-        for entry in atom_lookup['acceptor']:
-            sel_atoms = entry['sel_atoms']
-            allowed_at_frame = entry['is_allowed'][global_frame_idx]
-
-            if len(acceptor_row1):
-                acceptor_in_row1 = np.isin(pair_col0, sel_atoms)
-                suppress = acceptor_in_row1 & ~allowed_at_frame
-                if suppress.any():
-                    inters_chunk[np.ix_(suppress, acceptor_row1)] = False
-
-            if len(acceptor_row2):
-                acceptor_in_row2 = np.isin(pair_col1, sel_atoms)
-                suppress = acceptor_in_row2 & ~allowed_at_frame
-                if suppress.any():
-                    inters_chunk[np.ix_(suppress, acceptor_row2)] = False
+                    inters_chunk[np.ix_(suppress, cols)] = False
 
         still_active = inters_chunk.any(axis=1)
         return ijf_chunk[still_active], inters_chunk[still_active]
